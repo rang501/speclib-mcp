@@ -5,12 +5,20 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const API_URL = (process.env.SPECLIB_API_URL || "http://localhost:3000").replace(/\/+$/, "");
+const API_TOKEN = process.env.SPECLIB_API_TOKEN || "";
 
 // --- Helpers ---
 
-async function apiFetch(path) {
+async function apiFetch(path, options = {}) {
   const url = `${API_URL}${path}`;
-  const res = await fetch(url);
+  const headers = { ...options.headers };
+  if (API_TOKEN) {
+    headers["Authorization"] = `Bearer ${API_TOKEN}`;
+  }
+  if (options.body) {
+    headers["Content-Type"] = "application/json";
+  }
+  const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`API ${res.status}: ${body || res.statusText}`);
@@ -189,6 +197,81 @@ server.tool(
       const recipe = await apiFetch(`/api/recipes/${id}`);
       return {
         content: [{ type: "text", text: JSON.stringify(recipe, null, 2) }],
+      };
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "create_spec",
+  "Create a new spec in SpecLib. Requires SPECLIB_API_TOKEN to be configured.",
+  {
+    title: z.string().min(1).max(200).describe("Spec title"),
+    content: z.string().min(1).max(50000).describe("Spec content"),
+    type: z.enum(["TEXT", "YAML", "MARKDOWN"]).optional().describe("Content type (default: TEXT)"),
+    tags: z.array(z.string()).optional().describe("Tags for the spec"),
+    scope_id: z.number().int().positive().optional().describe("Scope ID to assign the spec to"),
+    is_public: z.boolean().optional().describe("Whether the spec is public (default: true)"),
+    instructions: z.string().optional().describe("Usage instructions for the spec"),
+  },
+  async ({ title, content, type, tags, scope_id, is_public, instructions }) => {
+    try {
+      if (!API_TOKEN) {
+        return errorResult("SPECLIB_API_TOKEN environment variable is required to create specs.");
+      }
+      const body = { title, content };
+      if (type) body.type = type;
+      if (tags) body.tags = tags;
+      if (scope_id) body.scopeId = scope_id;
+      if (is_public !== undefined) body.isPublic = is_public;
+      if (instructions) body.instructions = instructions;
+
+      const spec = await apiFetch("/api/specs", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(spec, null, 2) }],
+      };
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "update_spec",
+  "Update an existing spec in SpecLib. Requires SPECLIB_API_TOKEN to be configured.",
+  {
+    id: z.number().int().positive().describe("Spec ID to update"),
+    title: z.string().min(1).max(200).optional().describe("New title"),
+    content: z.string().min(1).max(50000).optional().describe("New content"),
+    type: z.enum(["TEXT", "YAML", "MARKDOWN"]).optional().describe("New content type"),
+    tags: z.array(z.string()).optional().describe("New tags"),
+    is_public: z.boolean().optional().describe("Whether the spec is public"),
+    instructions: z.string().optional().describe("New usage instructions"),
+  },
+  async ({ id, title, content, type, tags, is_public, instructions }) => {
+    try {
+      if (!API_TOKEN) {
+        return errorResult("SPECLIB_API_TOKEN environment variable is required to update specs.");
+      }
+      const body = {};
+      if (title) body.title = title;
+      if (content) body.content = content;
+      if (type) body.type = type;
+      if (tags) body.tags = tags;
+      if (is_public !== undefined) body.isPublic = is_public;
+      if (instructions !== undefined) body.instructions = instructions;
+
+      const spec = await apiFetch(`/api/specs/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(spec, null, 2) }],
       };
     } catch (err) {
       return errorResult(err.message);
