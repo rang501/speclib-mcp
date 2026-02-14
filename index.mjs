@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
@@ -40,16 +40,6 @@ function parseTags(tags) {
   }
 }
 
-function parseParameters(params) {
-  if (!params) return [];
-  if (Array.isArray(params)) return params;
-  try {
-    return JSON.parse(params);
-  } catch {
-    return [];
-  }
-}
-
 function errorResult(message) {
   return {
     content: [{ type: "text", text: `Error: ${message}` }],
@@ -57,39 +47,30 @@ function errorResult(message) {
   };
 }
 
+function jsonResult(data) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+  };
+}
+
 // --- Server ---
 
 const server = new McpServer({
   name: "speclib-mcp",
-  version: "1.0.0",
+  version: "2.0.0",
 });
 
-// --- Tools ---
+// --- Spec Tools ---
 
 server.tool(
   "search_specs",
-  "Search for specs in SpecLib. Returns summaries (without full content). Use get_spec to retrieve the full content of a specific spec.",
+  "Search for specs. Returns summaries with parsed tags. Use get_spec to retrieve full content.",
   {
     query: z.string().optional().describe("Search query - matches against title, tags, and content"),
-    scope: z.string().optional().describe("Filter by scope slug or name"),
-    type: z.enum(["TEXT", "YAML", "MARKDOWN"]).optional().describe("Filter by content type"),
   },
-  async ({ query, scope, type }) => {
+  async ({ query }) => {
     try {
       let specs = await apiFetch("/api/specs");
-
-      if (scope) {
-        const s = scope.toLowerCase();
-        specs = specs.filter(
-          (spec) =>
-            spec.scope &&
-            (spec.scope.slug.toLowerCase() === s || spec.scope.name.toLowerCase() === s)
-        );
-      }
-
-      if (type) {
-        specs = specs.filter((spec) => spec.type === type);
-      }
 
       if (query) {
         const q = query.toLowerCase();
@@ -97,6 +78,7 @@ server.tool(
           if (spec.title.toLowerCase().includes(q)) return true;
           const tags = parseTags(spec.tags);
           if (tags.some((tag) => tag.toLowerCase().includes(q))) return true;
+          if (spec.specIdentifier && spec.specIdentifier.toLowerCase().includes(q)) return true;
           if (spec.content && spec.content.toLowerCase().includes(q)) return true;
           return false;
         });
@@ -105,11 +87,12 @@ server.tool(
       const results = specs.map((spec) => ({
         id: spec.id,
         title: spec.title,
-        type: spec.type,
-        slug: spec.slug,
-        scope: spec.scope ? { name: spec.scope.name, slug: spec.scope.slug } : null,
+        specIdentifier: spec.specIdentifier,
         tags: parseTags(spec.tags),
-        instructions: spec.instructions || null,
+        isPublic: spec.isPublic,
+        userEmail: spec.userEmail,
+        createdAt: spec.createdAt,
+        updatedAt: spec.updatedAt,
       }));
 
       return {
@@ -130,73 +113,36 @@ server.tool(
 
 server.tool(
   "get_spec",
-  "Get the full content of a spec. Provide either an id, or a scope and slug combination.",
+  "Get the full spec by its numeric ID, including the frontmatter+body content.",
   {
-    id: z.number().int().positive().optional().describe("Spec ID"),
-    scope: z.string().optional().describe("Scope slug (use with slug)"),
-    slug: z.string().optional().describe("Spec slug (use with scope)"),
-  },
-  async ({ id, scope, slug }) => {
-    try {
-      if (id) {
-        const spec = await apiFetch(`/api/specs/${id}`);
-        const result = {
-          ...spec,
-          tags: parseTags(spec.tags),
-          parameters: parseParameters(spec.parameters),
-          scope: spec.scope ? { name: spec.scope.name, slug: spec.scope.slug } : null,
-        };
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-
-      if (scope && slug) {
-        const content = await apiFetch(`/api/specs/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}`);
-        return {
-          content: [{ type: "text", text: content }],
-        };
-      }
-
-      return errorResult("Provide either 'id' or both 'scope' and 'slug'.");
-    } catch (err) {
-      return errorResult(err.message);
-    }
-  }
-);
-
-server.tool(
-  "list_scopes",
-  "List all available scopes in SpecLib. Use scope slugs to filter specs or retrieve specs by scope/slug.",
-  {},
-  async () => {
-    try {
-      const scopes = await apiFetch("/api/scopes");
-      const results = scopes.map((s) => ({
-        id: s.id,
-        name: s.name,
-        slug: s.slug,
-      }));
-      return {
-        content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-      };
-    } catch (err) {
-      return errorResult(err.message);
-    }
-  }
-);
-
-server.tool(
-  "get_recipe",
-  "Get a recipe by ID, including all its bundled specs with full content.",
-  {
-    id: z.number().int().positive().describe("Recipe ID"),
+    id: z.number().int().positive().describe("Spec ID"),
   },
   async ({ id }) => {
     try {
-      const recipe = await apiFetch(`/api/recipes/${id}`);
+      const spec = await apiFetch(`/api/specs/${id}`);
+      return jsonResult({
+        ...spec,
+        tags: parseTags(spec.tags),
+      });
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "resolve_spec",
+  "Resolve a spec by its identifier (e.g. drupal.module.create). Returns the raw markdown content (frontmatter+body). Only works for public specs.",
+  {
+    identifier: z.string().describe("Spec identifier using dot notation, e.g. drupal.module.create"),
+  },
+  async ({ identifier }) => {
+    try {
+      // The resolve endpoint uses path segments: drupal.module.create -> resolve/drupal/module/create
+      const path = identifier.replace(/\./g, "/");
+      const data = await apiFetch(`/api/specs/resolve/${path}`);
       return {
-        content: [{ type: "text", text: JSON.stringify(recipe, null, 2) }],
+        content: [{ type: "text", text: String(data) }],
       };
     } catch (err) {
       return errorResult(err.message);
@@ -206,35 +152,22 @@ server.tool(
 
 server.tool(
   "create_spec",
-  "Create a new spec in SpecLib. Requires SPECLIB_API_TOKEN to be configured.",
+  "Create a new spec. Content must be a full frontmatter+body markdown document. The frontmatter must include at minimum: schema (spec/v1), id (dot-separated identifier), title, and version. Requires SPECLIB_API_TOKEN.",
   {
-    title: z.string().min(1).max(200).describe("Spec title"),
-    content: z.string().min(1).max(50000).describe("Spec content"),
-    type: z.enum(["TEXT", "YAML", "MARKDOWN"]).optional().describe("Content type (default: TEXT)"),
-    tags: z.array(z.string()).optional().describe("Tags for the spec"),
-    scope_id: z.number().int().positive().optional().describe("Scope ID to assign the spec to"),
-    is_public: z.boolean().optional().describe("Whether the spec is public (default: true)"),
-    instructions: z.string().optional().describe("Usage instructions for the spec"),
+    content: z.string().min(1).max(150000).describe(
+      "Full spec document with YAML frontmatter and markdown body, e.g.:\n---\nschema: spec/v1\nid: my.example.spec\nversion: 1.0.0\ntitle: My Example Spec\n---\n\nBody content here..."
+    ),
   },
-  async ({ title, content, type, tags, scope_id, is_public, instructions }) => {
+  async ({ content }) => {
     try {
       if (!API_TOKEN) {
         return errorResult("SPECLIB_API_TOKEN environment variable is required to create specs.");
       }
-      const body = { title, content };
-      if (type) body.type = type;
-      if (tags) body.tags = tags;
-      if (scope_id) body.scopeId = scope_id;
-      if (is_public !== undefined) body.isPublic = is_public;
-      if (instructions) body.instructions = instructions;
-
       const spec = await apiFetch("/api/specs", {
         method: "POST",
-        body: JSON.stringify(body),
+        body: JSON.stringify({ content }),
       });
-      return {
-        content: [{ type: "text", text: JSON.stringify(spec, null, 2) }],
-      };
+      return jsonResult(spec);
     } catch (err) {
       return errorResult(err.message);
     }
@@ -243,36 +176,139 @@ server.tool(
 
 server.tool(
   "update_spec",
-  "Update an existing spec in SpecLib. Requires SPECLIB_API_TOKEN to be configured.",
+  "Update an existing spec. Content must be a full frontmatter+body markdown document replacing the entire spec. If you are not the owner, this creates a pending revision for the owner to review. Requires SPECLIB_API_TOKEN.",
   {
     id: z.number().int().positive().describe("Spec ID to update"),
-    title: z.string().min(1).max(200).optional().describe("New title"),
-    content: z.string().min(1).max(50000).optional().describe("New content"),
-    type: z.enum(["TEXT", "YAML", "MARKDOWN"]).optional().describe("New content type"),
-    tags: z.array(z.string()).optional().describe("New tags"),
-    is_public: z.boolean().optional().describe("Whether the spec is public"),
-    instructions: z.string().optional().describe("New usage instructions"),
+    content: z.string().min(1).max(150000).describe("Full replacement spec document with YAML frontmatter and markdown body"),
   },
-  async ({ id, title, content, type, tags, is_public, instructions }) => {
+  async ({ id, content }) => {
     try {
       if (!API_TOKEN) {
         return errorResult("SPECLIB_API_TOKEN environment variable is required to update specs.");
       }
-      const body = {};
-      if (title) body.title = title;
-      if (content) body.content = content;
-      if (type) body.type = type;
-      if (tags) body.tags = tags;
-      if (is_public !== undefined) body.isPublic = is_public;
-      if (instructions !== undefined) body.instructions = instructions;
-
       const spec = await apiFetch(`/api/specs/${id}`, {
         method: "PUT",
-        body: JSON.stringify(body),
+        body: JSON.stringify({ content }),
       });
-      return {
-        content: [{ type: "text", text: JSON.stringify(spec, null, 2) }],
-      };
+      return jsonResult(spec);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "fork_spec",
+  "Fork a spec into your own private copy. The forked spec gets visibility set to private and your email as author. Requires SPECLIB_API_TOKEN.",
+  { id: z.number().int().positive().describe("Spec ID to fork") },
+  async ({ id }) => {
+    try {
+      if (!API_TOKEN) {
+        return errorResult("SPECLIB_API_TOKEN environment variable is required to fork specs.");
+      }
+      const spec = await apiFetch(`/api/specs/${id}/fork`, { method: "POST" });
+      return jsonResult(spec);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+// --- Recipe Tools ---
+
+server.tool(
+  "list_recipes",
+  "List all recipes. Returns public recipes and, if authenticated, your private recipes.",
+  {},
+  async () => {
+    try {
+      const recipes = await apiFetch("/api/recipes");
+      return jsonResult(recipes);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "get_recipe",
+  "Get a recipe by ID, including its linked specs with full content.",
+  {
+    id: z.number().int().positive().describe("Recipe ID"),
+  },
+  async ({ id }) => {
+    try {
+      const recipe = await apiFetch(`/api/recipes/${id}`);
+      return jsonResult(recipe);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "create_recipe",
+  "Create a new recipe. A recipe bundles multiple specs together with an optional recipe-level spec/instructions. Requires SPECLIB_API_TOKEN.",
+  {
+    name: z.string().min(1).max(200).describe("Recipe name"),
+    description: z.string().max(2000).optional().describe("Short description of the recipe"),
+    spec: z.string().max(50000).optional().describe("Recipe-level spec/instructions content"),
+    isPublic: z.boolean().default(true).describe("Whether the recipe is public"),
+    specIds: z.array(z.number().int().positive()).max(100).default([]).describe("Array of spec IDs to include in this recipe"),
+  },
+  async (args) => {
+    try {
+      if (!API_TOKEN) {
+        return errorResult("SPECLIB_API_TOKEN environment variable is required to create recipes.");
+      }
+      const recipe = await apiFetch("/api/recipes", {
+        method: "POST",
+        body: JSON.stringify(args),
+      });
+      return jsonResult(recipe);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+server.tool(
+  "update_recipe",
+  "Update an existing recipe. If you are not the owner, this creates a pending revision for the owner to review. Requires SPECLIB_API_TOKEN.",
+  {
+    id: z.number().int().positive().describe("Recipe ID to update"),
+    name: z.string().min(1).max(200).describe("Recipe name"),
+    description: z.string().max(2000).optional().describe("Short description of the recipe"),
+    spec: z.string().max(50000).optional().describe("Recipe-level spec/instructions content"),
+    isPublic: z.boolean().optional().describe("Whether the recipe is public"),
+    specIds: z.array(z.number().int().positive()).max(100).optional().describe("Array of spec IDs to include in this recipe"),
+  },
+  async ({ id, ...rest }) => {
+    try {
+      if (!API_TOKEN) {
+        return errorResult("SPECLIB_API_TOKEN environment variable is required to update recipes.");
+      }
+      const recipe = await apiFetch(`/api/recipes/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(rest),
+      });
+      return jsonResult(recipe);
+    } catch (err) {
+      return errorResult(err.message);
+    }
+  }
+);
+
+// --- Scope Tools ---
+
+server.tool(
+  "list_scopes",
+  "List all available scopes (categories for organizing specs).",
+  {},
+  async () => {
+    try {
+      const scopes = await apiFetch("/api/scopes");
+      return jsonResult(scopes);
     } catch (err) {
       return errorResult(err.message);
     }
@@ -283,11 +319,12 @@ server.tool(
 
 server.resource(
   "spec",
-  new ResourceTemplate("spec://{scope}/{slug}", { list: undefined }),
-  { mimeType: "text/markdown" },
+  "spec://{identifier}",
+  { mimeType: "text/markdown", description: "Resolve a spec by its dot-notation identifier" },
   async (uri, variables) => {
-    const { scope, slug } = variables;
-    const content = await apiFetch(`/api/specs/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}`);
+    const { identifier } = variables;
+    const path = identifier.replace(/\./g, "/");
+    const content = await apiFetch(`/api/specs/resolve/${path}`);
     return {
       contents: [{ uri: uri.href, text: content, mimeType: "text/markdown" }],
     };
